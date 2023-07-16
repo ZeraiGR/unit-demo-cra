@@ -3,21 +3,154 @@ name: Release CI
 on:
   push:
     tags:
-      - 'v[0-9]+.*'
+      - 'v[0-9]+'
+
 jobs:
-  make-changelog:
+  make_changelog:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v3
-      
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
-          name: ${{ github.ref }}
-          body: |
-            This is the release ${{ github.ref }}.
-            Add more description here if needed.
+          fetch-depth: 0
+          token: ${{ secrets.MAKE_PR_PAT }}
+
+      - name: Create release branch
+        run: |
+          BRANCH_NAME=release-${{ github.ref_name }}
+          git checkout -b $BRANCH_NAME
+          git push -u origin $BRANCH_NAME
+
+      - name: Get Last Release Tag
+        id: last_tag
+        shell: bash
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 ${{ github.ref_name }}^)
+          echo "last_tag=${LAST_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Install auto-changelog
+        run: npm install -g auto-changelog
+
+      - name: Generate Changelog
+        run: auto-changelog --output CHANGELOG.md --starting-version ${{ steps.last_tag.outputs.last_tag }}
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: changelog
+          path: CHANGELOG.md
+
+  create_release:
+    runs-on: ubuntu-latest
+    needs: make_changelog
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set Release Name
+        run: echo "RELEASE_NAME=$(echo ${{ github.ref }} | sed 's#refs/tags/##')" >> $GITHUB_ENV
+
+      - uses: actions/download-artifact@v3
+        id: download
+        with:
+          name: changelog
+          path: changelog
+
+      - name: Create Release
+        run: |
+          gh release create ${{ env.RELEASE_NAME }} -F ${{ steps.download.outputs.download-path }}/CHANGELOG.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  base_checks:
+    uses: ./.github/workflows/base-ci.yaml
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [create_release, base_checks]
+
+    outputs:
+      deploy_status: ${{ steps.deploy.outcome }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+      - name: Build Application
+        run: npm run build
+
+      - name: Deploy 🚀
+        id: deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: build # The folder the action should deploy.
+
+  create_issue:
+    runs-on: ubuntu-latest
+    needs: [base_checks, make_changelog, deploy]
+
+    outputs:
+      issue_number: ${{ steps.create_or_update_issue.outputs.number }}
+
+    permissions:
+      contents: write
+      issues: write
+    
+    steps: 
+      - uses: actions/checkout@v3
+
+      - name: Get Release Name
+        run: echo "RELEASE_NAME=$(echo ${{ github.ref_name }})" >> $GITHUB_ENV
+
+      - name: Get Release Date
+        id: release_date
+        run: echo "RELEASE_DATE=$(git show -s --format=%ci ${{ env.RELEASE_NAME }})" >> $GITHUB_ENV
+
+      - uses: actions/download-artifact@v3
+        id: download
+        with:
+          name: changelog
+          path: changelog
+
+      - name: Read Changelog
+        id: read_changelog
+        run: |
+          CHANGELOG_CONTENT=$(cat ${{ steps.download.outputs.download-path }}/CHANGELOG.md)
+          echo "CHANGELOG_CONTENT<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG_CONTENT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Get result url
+        id: result_url
+        run: |
+          URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "RESULT_URL=${URL}" >> "$GITHUB_ENV"
+
+      - name: Create or Update Release Issue
+        id: create_or_update_issue
+        uses: JasonEtco/create-an-issue@v2
+        with:
+          update_existing: true
+          search_existing: all
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_AUTHOR: ${{ github.actor }}
+          RELEASE_NAME: ${{ env.RELEASE_NAME }}
+          RELEASE_DATE: ${{ env.RELEASE_DATE }}
+          RELEASE_CHANGELOG: ${{ env.CHANGELOG_CONTENT }}
+          RELEASE_RESULT_URL: ${{ env.RESULT_URL }}
+          RELEASE_DEPLOY_STATUS: ${{ needs.deploy.outputs.deploy_status }}
+
+  close-issue:
+    runs-on: ubuntu-latest
+    needs: create_issue
+    steps:
+      - name: Close Issue
+        uses: peter-evans/close-issue@v3
+        with:
+          issue-number: ${{ needs.create_issue.outputs.issue_number }}
+          comment: |
+            Success release was finished
